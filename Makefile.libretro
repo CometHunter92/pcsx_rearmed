@@ -375,7 +375,7 @@ else ifeq ($(platform), rk3326)
     DYNAREC = ari64
     LDFLAGS += -static-libgcc -static-libstdc++ -fPIC 
 
-# Odroid-Go Advance (32 bit)
+# Odroid-Go Advance (64 bit)
 else ifeq ($(platform), rk3326_64)
     TARGET := $(TARGET_NAME)_libretro.so
     ARCH := arm64
