@@ -495,8 +495,19 @@ void plat_trigger_vibrate(int pad, int low, int high)
 
    if (in_enable_vibration)
    {
-      rumble_cb(pad, RETRO_RUMBLE_STRONG, high << 8);
-      rumble_cb(pad, RETRO_RUMBLE_WEAK, low ? 0xffff : 0x0);
+      int total_strength;
+      if(high > 0){
+         total_strength = 1000000 - (((double)high * 1000000) / 255.0);
+      } else if (low > 0){
+         total_strength = 100000; //We only have one motor, so this will have to do to make it weak enough
+      } else {
+         total_strength = 1000000; //turn it off
+      }
+      
+      FILE *fp;
+      fp = fopen("/sys/class/pwm/pwmchip0/pwm0/duty_cycle", "w");
+      fprintf(fp, "%u", total_strength);
+      fclose(fp);
    }
 }
 
