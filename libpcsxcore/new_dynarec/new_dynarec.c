@@ -49,6 +49,7 @@
 
 //#define DISASM
 //#define ASSEM_PRINT
+//#define REG_ALLOC_PRINT
 
 #ifdef ASSEM_PRINT
 #define assem_debug printf
@@ -118,9 +119,13 @@ enum stub_type {
   INVCODE_STUB = 14,
 };
 
+// regmap_pre[i]    - regs before [i] insn starts; dirty things here that
+//                    don't match .regmap will be written back
+// [i].regmap_entry - regs that must be set up if someone jumps here
+// [i].regmap       - regs [i] insn will read/(over)write
 struct regstat
 {
-  signed char regmap_entry[HOST_REGS]; // pre-insn + loop preloaded regs?
+  signed char regmap_entry[HOST_REGS];
   signed char regmap[HOST_REGS];
   uint64_t wasdirty;
   uint64_t dirty;
@@ -206,7 +211,7 @@ static struct decoded_insn
   static u_int ba[MAXBLOCK];
   static uint64_t unneeded_reg[MAXBLOCK];
   static uint64_t branch_unneeded_reg[MAXBLOCK];
-  // pre-instruction [i], excluding loop-preload regs?
+  // see 'struct regstat' for a description
   static signed char regmap_pre[MAXBLOCK][HOST_REGS];
   // contains 'real' consts at [i] insn, but may differ from what's actually
   // loaded in host reg as 'final' value is always loaded, see get_final_value()
@@ -297,7 +302,7 @@ static struct decoded_insn
 //#define FLOAT 19  // Floating point unit
 //#define FCONV 20  // Convert integer to float
 //#define FCOMP 21  // Floating point compare (sets FSREG)
-#define SYSCALL 22// SYSCALL
+#define SYSCALL 22// SYSCALL,BREAK
 #define OTHER 23  // Other
 #define SPAN 24   // Branch/delay slot spans 2 pages
 #define NI 25     // Not implemented
@@ -328,6 +333,10 @@ void verify_code_ds();
 void cc_interrupt();
 void fp_exception();
 void fp_exception_ds();
+void jump_syscall   (u_int u0, u_int u1, u_int pc);
+void jump_syscall_ds(u_int u0, u_int u1, u_int pc);
+void jump_break   (u_int u0, u_int u1, u_int pc);
+void jump_break_ds(u_int u0, u_int u1, u_int pc);
 void jump_to_new_pc();
 void call_gteStall();
 void new_dyna_leave();
@@ -594,10 +603,9 @@ void *get_addr_ht(u_int vaddr)
   return get_addr(vaddr);
 }
 
-void clear_all_regs(signed char regmap[])
+static void clear_all_regs(signed char regmap[])
 {
-  int hr;
-  for (hr=0;hr<HOST_REGS;hr++) regmap[hr]=-1;
+  memset(regmap, -1, sizeof(regmap[0]) * HOST_REGS);
 }
 
 static signed char get_reg(const signed char regmap[],int r)
@@ -926,6 +934,10 @@ static const struct {
   FUNCNAME(jump_handler_write32),
   FUNCNAME(invalidate_addr),
   FUNCNAME(jump_to_new_pc),
+  FUNCNAME(jump_break),
+  FUNCNAME(jump_break_ds),
+  FUNCNAME(jump_syscall),
+  FUNCNAME(jump_syscall_ds),
   FUNCNAME(call_gteStall),
   FUNCNAME(new_dyna_leave),
   FUNCNAME(pcsx_mtc0),
@@ -3935,9 +3947,16 @@ static void call_c_cpu_handler(int i, const struct regstat *i_regs, int ccadj_, 
 
 static void syscall_assemble(int i, const struct regstat *i_regs, int ccadj_)
 {
-  emit_movimm(0x20,0); // cause code
-  emit_movimm(0,1);    // not in delay slot
-  call_c_cpu_handler(i, i_regs, ccadj_, start+i*4, psxException);
+  // 'break' tends to be littered around to catch things like
+  // division by 0 and is almost never executed, so don't emit much code here
+  void *func = (dops[i].opcode2 == 0x0C)
+    ? (is_delayslot ? jump_syscall_ds : jump_syscall)
+    : (is_delayslot ? jump_break_ds : jump_break);
+  signed char ccreg = get_reg(i_regs->regmap, CCREG);
+  assert(ccreg == HOST_CCREG);
+  emit_movimm(start + i*4, 2); // pc
+  emit_addimm(HOST_CCREG, ccadj_ + CLOCK_ADJUST(1), HOST_CCREG);
+  emit_far_jump(func);
 }
 
 static void hlecall_assemble(int i, const struct regstat *i_regs, int ccadj_)
@@ -6125,8 +6144,21 @@ static void pagespan_ds()
   load_regs_bt(regs[0].regmap,regs[0].dirty,start+4);
 }
 
+static void check_regmap(signed char *regmap)
+{
+#ifndef NDEBUG
+  int i,j;
+  for (i = 0; i < HOST_REGS; i++) {
+    if (regmap[i] < 0)
+      continue;
+    for (j = i + 1; j < HOST_REGS; j++)
+      assert(regmap[i] != regmap[j]);
+  }
+#endif
+}
+
 // Basic liveness analysis for MIPS registers
-void unneeded_registers(int istart,int iend,int r)
+static void unneeded_registers(int istart,int iend,int r)
 {
   int i;
   uint64_t u,gte_u,b,gte_b;
@@ -7200,7 +7232,7 @@ int new_recompile_block(u_int addr)
           case 0x08: strcpy(insn[i],"JR"); type=RJUMP; break;
           case 0x09: strcpy(insn[i],"JALR"); type=RJUMP; break;
           case 0x0C: strcpy(insn[i],"SYSCALL"); type=SYSCALL; break;
-          case 0x0D: strcpy(insn[i],"BREAK"); type=OTHER; break;
+          case 0x0D: strcpy(insn[i],"BREAK"); type=SYSCALL; break;
           case 0x0F: strcpy(insn[i],"SYNC"); type=OTHER; break;
           case 0x10: strcpy(insn[i],"MFHI"); type=MOV; break;
           case 0x11: strcpy(insn[i],"MTHI"); type=MOV; break;
@@ -7646,9 +7678,9 @@ int new_recompile_block(u_int addr)
       // Don't get too close to the limit
       if(i>MAXBLOCK/2) done=1;
     }
-    if(dops[i].itype==SYSCALL&&stop_after_jal) done=1;
-    if(dops[i].itype==HLECALL||dops[i].itype==INTCALL) done=2;
-    if(done==2) {
+    if (dops[i].itype == SYSCALL || dops[i].itype == HLECALL || dops[i].itype == INTCALL)
+      done = stop_after_jal ? 1 : 2;
+    if (done == 2) {
       // Does the block continue due to a branch?
       for(j=i-1;j>=0;j--)
       {
@@ -7684,14 +7716,16 @@ int new_recompile_block(u_int addr)
   /* Pass 3 - Register allocation */
 
   struct regstat current; // Current register allocations/status
-  current.dirty=0;
-  current.u=unneeded_reg[0];
+  clear_all_regs(current.regmap_entry);
   clear_all_regs(current.regmap);
-  alloc_reg(&current,0,CCREG);
-  dirty_reg(&current,CCREG);
-  current.isconst=0;
-  current.wasconst=0;
-  current.waswritten=0;
+  current.wasdirty = current.dirty = 0;
+  current.u = unneeded_reg[0];
+  alloc_reg(&current, 0, CCREG);
+  dirty_reg(&current, CCREG);
+  current.wasconst = 0;
+  current.isconst = 0;
+  current.loadedconst = 0;
+  current.waswritten = 0;
   int ds=0;
   int cc=0;
   int hr=-1;
@@ -7722,6 +7756,9 @@ int new_recompile_block(u_int addr)
     memcpy(regmap_pre[i],current.regmap,sizeof(current.regmap));
     regs[i].wasconst=current.isconst;
     regs[i].wasdirty=current.dirty;
+    regs[i].dirty=0;
+    regs[i].u=0;
+    regs[i].isconst=0;
     regs[i].loadedconst=0;
     if (!dops[i].is_jump) {
       if(i+1<slen) {
@@ -8484,6 +8521,8 @@ int new_recompile_block(u_int addr)
           {
             regs[i].regmap[hr]=-1;
             regs[i].isconst&=~(1<<hr);
+            regs[i].dirty&=~(1<<hr);
+            regs[i+1].wasdirty&=~(1<<hr);
             if((branch_regs[i].regmap[hr]&63)!=dops[i].rs1 && (branch_regs[i].regmap[hr]&63)!=dops[i].rs2 &&
                (branch_regs[i].regmap[hr]&63)!=dops[i].rt1 && (branch_regs[i].regmap[hr]&63)!=dops[i].rt2 &&
                (branch_regs[i].regmap[hr]&63)!=dops[i+1].rt1 && (branch_regs[i].regmap[hr]&63)!=dops[i+1].rt2 &&
@@ -8537,6 +8576,8 @@ int new_recompile_block(u_int addr)
               }
               regs[i].regmap[hr]=-1;
               regs[i].isconst&=~(1<<hr);
+              regs[i].dirty&=~(1<<hr);
+              regs[i+1].wasdirty&=~(1<<hr);
             }
           }
         }
@@ -8622,11 +8663,8 @@ int new_recompile_block(u_int addr)
                   //printf("Hit %x -> %x, %x %d/%d\n",start+i*4,ba[i],start+j*4,hr,r);
                   int k;
                   if(regs[i].regmap[hr]==-1&&branch_regs[i].regmap[hr]==-1) {
+                    if(get_reg(regs[i].regmap,f_regmap[hr])>=0) break;
                     if(get_reg(regs[i+2].regmap,f_regmap[hr])>=0) break;
-                    if(r>63) {
-                      if(get_reg(regs[i].regmap,r&63)<0) break;
-                      if(get_reg(branch_regs[i].regmap,r&63)<0) break;
-                    }
                     k=i;
                     while(k>1&&regs[k-1].regmap[hr]==-1) {
                       if(count_free_regs(regs[k-1].regmap)<=minimum_free_regs[k-1]) {
@@ -8645,7 +8683,6 @@ int new_recompile_block(u_int addr)
                       if(k>2&&(dops[k-3].itype==UJUMP||dops[k-3].itype==RJUMP)&&dops[k-3].rt1==31) {
                         break;
                       }
-                      assert(r < 64);
                       k--;
                     }
                     if(regs[k-1].regmap[hr]==f_regmap[hr]&&regmap_pre[k][hr]==f_regmap[hr]) {
@@ -8924,7 +8961,10 @@ int new_recompile_block(u_int addr)
             if(get_reg(regs[i+1].regmap,dops[i+1].rs1)<0) {
               hr=get_reg2(regs[i].regmap,regs[i+1].regmap,-1);
               if(hr<0) hr=get_reg(regs[i+1].regmap,-1);
-              else {regs[i+1].regmap[hr]=AGEN1+((i+1)&1);regs[i+1].isconst&=~(1<<hr);}
+              else {
+                regs[i+1].regmap[hr]=AGEN1+((i+1)&1);
+                regs[i+1].isconst&=~(1<<hr);
+              }
               assert(hr>=0);
               if(regs[i].regmap[hr]<0&&regs[i+1].regmap_entry[hr]<0)
               {
@@ -9021,7 +9061,7 @@ int new_recompile_block(u_int addr)
     dops[slen-1].bt=1; // Mark as a branch target so instruction can restart after exception
   }
 
-#ifdef DISASM
+#ifdef REG_ALLOC_PRINT
   /* Debug/disassembly */
   for(i=0;i<slen;i++)
   {
@@ -9153,7 +9193,7 @@ int new_recompile_block(u_int addr)
       #endif
     }
   }
-#endif // DISASM
+#endif // REG_ALLOC_PRINT
 
   /* Pass 8 - Assembly */
   linkcount=0;stubcount=0;
@@ -9186,6 +9226,9 @@ int new_recompile_block(u_int addr)
   }
   for(i=0;i<slen;i++)
   {
+    check_regmap(regmap_pre[i]);
+    check_regmap(regs[i].regmap_entry);
+    check_regmap(regs[i].regmap);
     //if(ds) printf("ds: ");
     disassemble_inst(i);
     if(ds) {
