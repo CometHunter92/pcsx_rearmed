@@ -522,12 +522,8 @@ static void emit_pcreladdr(u_int rt)
 
 static void emit_loadreg(int r, int hr)
 {
-  if(r&64) {
-    SysPrintf("64bit load in 32bit mode!\n");
-    assert(0);
-    return;
-  }
-  if((r&63)==0)
+  assert(hr != EXCLUDE_REG);
+  if (r == 0)
     emit_zeroreg(hr);
   else {
     void *addr;
@@ -552,11 +548,7 @@ static void emit_loadreg(int r, int hr)
 
 static void emit_storereg(int r, int hr)
 {
-  if(r&64) {
-    SysPrintf("64bit store in 32bit mode!\n");
-    assert(0);
-    return;
-  }
+  assert(hr != EXCLUDE_REG);
   int addr = (int)&psxRegs.GPR.r[r];
   switch (r) {
   //case HIREG: addr = &hi; break;
@@ -1808,7 +1800,7 @@ static void inline_readstub(enum stub_type type, int i, u_int addr,
 {
   int rs=get_reg(regmap,target);
   int rt=get_reg(regmap,target);
-  if(rs<0) rs=get_reg(regmap,-1);
+  if(rs<0) rs=get_reg_temp(regmap);
   assert(rs>=0);
   u_int is_dynamic;
   uintptr_t host_addr = 0;
@@ -1962,7 +1954,7 @@ static void do_writestub(int n)
 static void inline_writestub(enum stub_type type, int i, u_int addr,
   const signed char regmap[], int target, int adj, u_int reglist)
 {
-  int rs=get_reg(regmap,-1);
+  int rs=get_reg_temp(regmap);
   int rt=get_reg(regmap,target);
   assert(rs>=0);
   assert(rt>=0);
